@@ -181,50 +181,50 @@ def load_chunks(
         after = 0
         while True:
             try:
-                with client.stream(
-                    "GET", endpoint, headers={"Range": f"bytes={after}-"}
-                ) as rsp:
-                    for chunk in rsp.iter_bytes(1 << 20):
+                headers = {"Range": f"bytes={after}-"}
+                with client.stream("GET", endpoint, headers=headers) as rsp:
+                    for chunk in rsp.iter_bytes():
                         after += len(chunk)
                         yield chunk
+                break
             except (httpx.RemoteProtocolError, httpx.ReadTimeout):
                 continue
 
     def _unzip_from(endpoint):
-        triplets = (
-            (name, size, b"".join(chunks))
-            for name, size, chunks in stream_unzip(_content_chunks(endpoint))
-        )
-        for triplet in triplets:
+        for name, size, chunks in stream_unzip(_content_chunks(endpoint)):
             buffer_bounds.acquire()
-            yield triplet
+            yield name, size, b"".join(chunks)
+        pass
 
-    with mpp.ThreadPool(decoder_threads) as decoder_pool:
-        endpoints = (url for url in fetch_blob_urls() if url.endswith(".zip"))
-        unzipped = it.chain.from_iterable(map(_unzip_from, it.cycle(endpoints)))
+    endpoints = [url for url in fetch_blob_urls() if url.endswith(".zip")]
 
-        def _pairs():
-            for pair in decoder_pool.imap(_im_decode, unzipped):
-                try:
-                    if pair is None:
-                        continue
-                    else:
-                        file_name, image = pair
-                        for view in views(image):
-                            yield (file_name, view)
-                finally:
-                    buffer_bounds.release()
+    def _pairs():
+        with mpp.ThreadPool(decoder_threads) as decoder_pool:
+            for endpoint in it.cycle(endpoints):
+                for pair in decoder_pool.imap(_im_decode, _unzip_from(endpoint)):
+                    try:
+                        if pair is None:
+                            continue
+                        else:
+                            file_name, image = pair
+                            for view in views(image):
+                                yield (file_name, view)
+                    finally:
+                        buffer_bounds.release()
 
-        def _collate(pairs):
-            file_names, images = zip(*pairs)
-            images = np.stack(images)
-            return images, _metadata(file_names)
+    def _collate(pairs):
+        file_names, images = zip(*pairs)
+        images = np.stack(images)
+        return images, _metadata(file_names)
 
-        yield from map(_collate, _batched(_pairs()))
+    yield from map(_collate, _batched(_pairs()))
 
 
 def main(posts_path="./posts.parquet"):
     posts = pl.read_parquet(posts_path)
-
-    for images, metadata in rp.track(load_chunks(posts)):
+    for images, metadata in rp.track(load_chunks(posts), total=1024):
         pass
+
+
+if __name__ == "__main__":
+    fire.Fire(main)
