@@ -30,6 +30,7 @@ from shard import LatentProjTracer, KernelProjTracer, QuantProjKernel
 
 class TrainState(train_state.TrainState):
     target: optax.Params
+    polyak: optax.Params
     rng: jax.random.PRNGKey
     loss: jax.Array
     loss_avg: optax.EmaState
@@ -95,7 +96,7 @@ def emplace(flat_params, flat_traces):
 def main(
     model_slug="SimianLuo/LCM_Dreamshaper_v7",
     posts_path="posts.parquet",
-    batch_size=8,
+    batch_size=64,
     peak_lr=2e-3,
     base_b1=0.85,
     peak_b1=0.95,
@@ -103,7 +104,9 @@ def main(
     cg_dropout=0.10,
     train_steps=1024,
     adapter_rank=64,
-    relora_every=384,
+    relora_every=1024,
+    lookahead_steps=8,
+    lookahead_alpha=0.5,
     init_scale: float = 0.01,
     gamma=0.1,
     seed=42,
@@ -190,14 +193,15 @@ def main(
         optax.zero_nans(),
         optax.clip_by_global_norm(1.0),
         optax.inject_hyperparams(optax.scale_by_lion)(msched),
+        # optax.inject_hyperparams(scale_by_lion_8bit, static_args=("block_size",))(
+        #     msched, mu_scale_dtype=jnp.bfloat16
+        # ),
         optax.inject_hyperparams(optax.scale)(lsched),
         optax.scale(-1),
     )
 
     # TODO: Figure out why flattening/sharding the optimizer states breaks everything
     # gradtx = optax.flatten(gradtx)
-    # TODO: lookahead?
-    # gradtx = optax.lookahead(gradtx, 8, 0.5)
 
     # TODO: figure out a way to compose 8-bit fwd/bwd with LoRa
     # def kernel(p, v):
@@ -238,7 +242,8 @@ def main(
             loss_avg=optax.ema(0.99).init(jnp.zeros([])),
             apply_fn=lambda: None,
             params=params,
-            target=params,
+            polyak=trainable(params),
+            target=trainable(params),
             tx=gradtx,
             opt_state=gradtx.init(trainable(params)),
         )
@@ -254,17 +259,6 @@ def main(
             v.a = jax.random.normal(key, v.a.shape, dtype=v.a.dtype) * init_scale
             v.b = jnp.zeros_like(v.b)
 
-        # def reinit(v):
-        #     if isinstance(v, lorax.LoraWeight):
-        #         nonlocal rng
-        #         rng, key = jax.random.split(rng)
-        #         v.w += v.materialize()
-        #         v.a = jax.random.normal(key, v.a.shape, dtype=v.a.dtype) * init_scale
-        #         v.b = jnp.zeros_like(v.b)
-        #     return v
-
-        # params = qax.utils.tree_map_with_implicit(reinit, params)
-        # return tstate.replace(params=params, rng=rng)
         return tstate.replace(rng=rng)
 
     @jax.value_and_grad
@@ -274,24 +268,38 @@ def main(
             online, target, {}, rng=rng, inputs=inputs
         )
 
+    def synchronize(online, polyak):
+        polyak = jtu.tree_map(
+            lambda phi, theta: phi + lookahead_alpha * (theta - phi), polyak, online
+        )
+        return polyak, polyak
+
+    def merge_updates(params, updated):
+        params = ftu.flatten_dict(params)
+        for k, b in updated.items():
+            params[k].b = b
+        params = ftu.unflatten_dict(params)
+        return params
+
     def train_step(tstate: TrainState, inputs: Inputs):
-        online, target = tstate.params, tstate.target
+        online = tstate.params
+        target = merge_updates(online, tstate.target)
         rng, key = jax.random.split(tstate.rng)
         loss, grads = loss_fn(trainable(online), online, target, key, inputs)
         loss, loss_avg = optax.ema(0.99).update(loss, tstate.loss_avg)
-        target = online
         updates, opt_state = tstate.tx.update(
             grads, tstate.opt_state, trainable(online)
         )
         updated = optax.apply_updates(trainable(online), updates)
-        online = {
-            k: replace(v, b=updated[k]) if k in updated else v
-            for k, v in ftu.flatten_dict(online).items()
-        }
-        online = ftu.unflatten_dict(online)
+        do_sync = tstate.step % lookahead_steps == 0
+        updated, polyak = jax.lax.cond(
+            do_sync, synchronize, lambda *args: tuple(args), updated, tstate.polyak
+        )
+        online = merge_updates(online, updated)
         tstate = tstate.replace(
             params=online,
-            target=target,
+            target=trainable(tstate.params),
+            polyak=polyak,
             opt_state=opt_state,
             loss=loss,
             loss_avg=loss_avg,
@@ -319,8 +327,8 @@ def main(
         )
         p_train_step = jax.jit(
             train_step,
-            # donate_argnums=0,
-            # out_shardings=jtu.tree_map(lambda a: a.sharding, tstate),
+            donate_argnums=0,
+            out_shardings=jtu.tree_map(lambda a: a.sharding, tstate),
         )
         tstate = p_train_step(tstate, inputs)
         loss = float(jax.device_get(tstate.loss))
